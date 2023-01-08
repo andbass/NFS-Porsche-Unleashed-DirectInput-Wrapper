@@ -2,7 +2,6 @@
 
 #include <cstdio>
 #include <cstdarg>
-
 #include <mutex>
 
 #define LOG_PRINT(fmt, ...) g_log.println("%s(): " fmt, __FUNCTION__ , __VA_ARGS__)

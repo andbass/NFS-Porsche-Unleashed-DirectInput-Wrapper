@@ -3,7 +3,10 @@
 #include "EnumDevices.h"
 #include "Log.h"
 
+#include "../minhook/include/MinHook.h"
+
 #include <Guiddef.h>
+#include <unordered_set>
 
 enum class InitState {
 	NEED_TO_INIT,
@@ -13,18 +16,20 @@ enum class InitState {
 
 static InitState g_initState = InitState::NEED_TO_INIT;
 static DirectInputCreateProc g_directInputCreateEx = nullptr;
+static std::unordered_set<void*> g_hookedFuncs;
 
 void prepareForHooks() {
 	if (g_initState != InitState::NEED_TO_INIT) {
+		// If we already initialized (either success or failure), don't do it again
 		return;
 	}
 
 	LOG_PRINT("Beginning initialization");
 
-	// TODO any other way to not recursively load ourselves?
+	// TODO don't load dinput this way - super brittle
 	HMODULE dinputDll = LoadLibraryA("C:/Windows/System32/dinput.dll");
 	if (dinputDll == nullptr) {
-		LOG_PRINT("Could not open dinput.dll");
+		LOG_PRINT("Could not open dinput.dll from 'C:/Windows/System32/'");
 		g_initState = InitState::FAILED;
 		return;
 	}
@@ -40,23 +45,58 @@ void prepareForHooks() {
 }
 
 bool installHooksOnDInput(REFIID dinputId, LPVOID* rawDInput) {
+	// TODO thread safety?
+	// We have to check that we don't install hooks more than once -
+	// Porsche Unleashed for some reason calls `DirectInputCreate*()` multiple times
 	if (IsEqualIID(dinputId, IID_IDirectInputA)) {
 		LOG_PRINT("Installing hooks for ascii version");
 
 		auto* dinputAsc = static_cast<LPDIRECTINPUTA>(*rawDInput);
+	
+		EnumDevicesAProc enumDevicesA = dinputAsc->lpVtbl->EnumDevices;
+		LOG_PRINT("Address of EnumDevices: %p", enumDevicesA);
 
+		if (g_hookedFuncs.count(enumDevicesA) == 0) {
+			// TODO check MH return values here
+			MH_CreateHook(enumDevicesA, customEnumDevicesA, reinterpret_cast<void**>(&g_origEnumDevicesA));
+			MH_EnableHook(enumDevicesA);
+
+			g_hookedFuncs.emplace(enumDevicesA);
+			LOG_PRINT("Hook installed for EnumDevicesA");
+		} else {
+			LOG_PRINT("Function already hooked - skipping");
+		}
 
 		return true;
 	} else if (IsEqualIID(dinputId, IID_IDirectInputW)) {
 		LOG_PRINT("Installing hooks for unicode version");
 
 		auto* dinputUni = static_cast<LPDIRECTINPUTW>(*rawDInput);
+
+		EnumDevicesWProc enumDevicesW = dinputUni->lpVtbl->EnumDevices;
+		LOG_PRINT("Address of EnumDevices: %p", enumDevicesW);
+
+		if (g_hookedFuncs.count(enumDevicesW) == 0) {
+			// TODO check MH return values here
+			MH_CreateHook(enumDevicesW, customEnumDevicesW, reinterpret_cast<void**>(&g_origEnumDevicesW));
+			MH_EnableHook(enumDevicesW);
+
+			g_hookedFuncs.emplace(enumDevicesW);
+			LOG_PRINT("Hook installed for EnumDevicesW");
+		} else {
+			LOG_PRINT("Function already hooked - skipping");
+		}
+
 		return true;
 	} else {
-		LOG_PRINT("Unrecognized IID found when installing hooks, exiting");
+		LOG_PRINT("Unrecognized IID found when installing hooks, bailing");
 		return false;
 	}
 }
+
+//
+// Functions below are called by the game in place of the standard DInput setup functions
+//
 
 HRESULT WINAPI DirectInputCreateEx(HINSTANCE hinst, DWORD dwVersion, REFIID riid, LPVOID* lplpDD, LPUNKNOWN punkOuter) {
 	LOG_PRINT("Invoked with version %#x", dwVersion);
@@ -64,7 +104,7 @@ HRESULT WINAPI DirectInputCreateEx(HINSTANCE hinst, DWORD dwVersion, REFIID riid
 	prepareForHooks();
 	if (g_initState == InitState::FAILED) {
 		LOG_PRINT("Initialization failed, triggering process exit");
-		exit(1);
+		exit(1); // TODO is this safe?
 	}
 
 	HRESULT result = g_directInputCreateEx(hinst, dwVersion, riid, lplpDD, punkOuter);
